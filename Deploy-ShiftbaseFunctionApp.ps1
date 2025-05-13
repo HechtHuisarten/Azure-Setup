@@ -1,85 +1,111 @@
 # --- Setup Azure Resource Naming Variables ---
 $RandomInt = Get-Random -Minimum 1000 -Maximum 9999
-$ProjectPrefix = "shiftbase-sync" # A prefix for your project resources
-$ResourceGroupName = "$($ProjectPrefix)-rg-ps"
-$StorageAccountName = "$($ProjectPrefix)storps$RandomInt" # Needs to be globally unique
-$FunctionAppName = "$($ProjectPrefix)-func-app-ps-$RandomInt" # Needs to be globally unique
-$AppInsightsName = "appi-ps-$FunctionAppName" # Application Insights name
-$Location = "northeurope"
-$PlanName = "$($FunctionAppName)-consumptionplan" # Name for the consumption plan
+$ProjectPrefix = "shiftbase-sync"
 
-# --- Application Configuration Variables (to be set as App Settings) ---
-# CRITICAL: Replace placeholder values with your actual data or use a secure method to inject them.
-# For an internship, you might hardcode them for your local script copy,
-# but NEVER commit actual secrets to a shared repository.
+# Adjusted Storage Account Name generation to meet Azure requirements (3-24 chars, lowercase, no hyphens)
+$StorageAccountProjectPrefix = ($ProjectPrefix -replace "-", "") # Removes hyphen -> "shiftbasesync" (13 chars)
+$StorageAccountUniqueSuffix = "stor" # Shortened suffix (4 chars)
+# Total potential length: 13 (prefix) + 4 (suffix) + 4 (RandomInt) = 21 chars. This is within 3-24 char limit.
+$StorageAccountName = "$($StorageAccountProjectPrefix)$($StorageAccountUniqueSuffix)$($RandomInt)".ToLower() # Ensure lowercase
+
+$ResourceGroupName = "$($ProjectPrefix)-rg-cli-ps" # Resource group names can have hyphens
+$FunctionAppName = "$($ProjectPrefix)-func-app-cli-ps-$($RandomInt)" # Function app names can have hyphens
+$AppInsightsName = "appi-cli-ps-$($FunctionAppName)" # App Insights names can have hyphens
+$Location = "northeurope"
+
+# --- Application Configuration Variables ---
+# CRITICAL: Replace placeholder values with your actual data.
 $ShiftbaseURL = "https://api.shiftbase.com/api/reports/schedule_detail"
 $ShiftbaseAPIKey = "YOUR_SHIFTBASE_API_KEY_HERE" # <<< !!! REPLACE WITH YOUR ACTUAL API KEY !!!
 $DBConnectionString = "YOUR_DB_CONNECTION_STRING_HERE" # <<< !!! REPLACE WITH YOUR ACTUAL CONNECTION STRING !!!
 $DBTargetTable = "ShiftbaseScheduleDetailedReport"
 
+Write-Host "Starting Azure resource deployment using Azure CLI via PowerShell..."
+Write-Host "Current Date: $(Get-Date)"
+Write-Host "Generated Storage Account Name: $StorageAccountName" # Added for debugging
+Write-Host ""
+
+# --- Log into Azure ---
+Write-Host "Attempting to log into Azure. You might be prompted."
+az login
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Azure CLI login failed. Please ensure Azure CLI is installed and you can log in manually. Script aborted."
+    exit 1
+}
+Write-Host "Azure CLI login successful or already logged in."
+Write-Host ""
+
+# --- Check current Azure CLI account ---
+Write-Host "Checking current Azure CLI account..."
+az account show
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Failed to verify Azure CLI account. Script aborted."
+    exit 1
+}
+Write-Host "Azure CLI account verified."
+Write-Host ""
+
 # --- Create a Resource Group ---
 Write-Host "Creating resource group: $ResourceGroupName in $Location..."
-New-AzResourceGroup -Name $ResourceGroupName -Location $Location -ErrorAction Stop | Out-Null
+az group create --name $ResourceGroupName --location $Location --output none
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create resource group. Script aborted."; exit 1 }
+Write-Host "Resource group '$ResourceGroupName' created successfully."
+Write-Host ""
 
 # --- Create an Azure Storage Account for the Function App ---
 Write-Host "Creating storage account: $StorageAccountName..."
-New-AzStorageAccount -ResourceGroupName $ResourceGroupName `
-    -Name $StorageAccountName `
-    -Location $Location `
-    -SkuName Standard_LRS `
-    -Kind StorageV2 `
-    -HttpsOnly $true `
-    -MinimumTlsVersion TLS1_2 `
-    -ErrorAction Stop | Out-Null
+az storage account create --name $StorageAccountName --resource-group $ResourceGroupName --location $Location --sku "Standard_LRS" --kind "StorageV2" --https-only true --min-tls-version "TLS1_2" --output none
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create storage account. Script aborted."; exit 1 }
+Write-Host "Storage account '$StorageAccountName' created successfully."
+Write-Host ""
 
 # --- Create Application Insights instance ---
 Write-Host "Creating Application Insights: $AppInsightsName..."
-$appInsights = New-AzApplicationInsights -Name $AppInsightsName `
-    -ResourceGroupName $ResourceGroupName `
-    -Location $Location `
-    -Kind web `
-    -ApplicationType web `
-    -ErrorAction Stop
+az monitor app-insights component create --app $AppInsightsName --location $Location --resource-group $ResourceGroupName --kind "web" --application-type "web" --output none
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create Application Insights. Script aborted."; exit 1 }
+Write-Host "Application Insights '$AppInsightsName' created successfully."
+Write-Host ""
 
-$AppInsightsInstrumentationKey = $appInsights.InstrumentationKey
-If (-not $AppInsightsInstrumentationKey) {
-    Write-Warning "Failed to retrieve Application Insights Instrumentation Key. Monitoring might be affected."
-    # Consider stopping the script if App Insights is absolutely critical: # exit 1
+# Get Application Insights Instrumentation Key
+Write-Host "Fetching Instrumentation Key for $AppInsightsName..."
+$AppInsightsInstrumentationKey = (az monitor app-insights component show --app $AppInsightsName --resource-group $ResourceGroupName --query "instrumentationKey" --output tsv)
+# Remove potential newline/carriage return from tsv output
+$AppInsightsInstrumentationKey = $AppInsightsInstrumentationKey -replace "`r","" -replace "`n",""
+
+if (-not $AppInsightsInstrumentationKey) {
+    Write-Warning "Failed to retrieve Application Insights Instrumentation Key. Monitoring might be affected. Continuing..."
 } Else {
     Write-Host "Successfully retrieved Instrumentation Key for $AppInsightsName."
 }
-
-# --- Define Application Settings for the Function App ---
-# These will be available as environment variables to your function code.
-$appSettings = @{
-    "FUNCTIONS_WORKER_RUNTIME"          = "python" # Assuming Python based on your previous context
-    "FUNCTIONS_EXTENSION_VERSION"       = "~4"
-    "WEBSITE_RUN_FROM_PACKAGE"          = "1"      # Recommended for deployment
-    "APPLICATIONINSIGHTS_CONNECTION_STRING" = "InstrumentationKey=$AppInsightsInstrumentationKey" # Modern way to connect App Insights
-
-    # Your custom application settings
-    "SHIFTBASE_API_URL"                 = $ShiftbaseURL
-    "SHIFTBASE_API_KEY"                 = $ShiftbaseAPIKey
-    "DB_CONNECTION_STRING"              = $DBConnectionString
-    "DB_TARGET_TABLE"                   = $DBTargetTable
-}
+Write-Host ""
 
 # --- Create a Function App ---
 Write-Host "Creating Function App: $FunctionAppName for Python on Linux in $Location..."
-New-AzFunctionApp -Name $FunctionAppName `
-    -ResourceGroupName $ResourceGroupName `
-    -Location $Location `
-    -StorageAccountName $StorageAccountName `
-    -Runtime Python ` # Ensure this matches your function's language
-    -RuntimeVersion "3.11" ` # Specify your Python version
-    -FunctionsVersion "4" `
-    -PlanName $PlanName ` # This will create a new consumption plan with this name
-    -Sku "Y1" ` # Y1 is the SKU for the Dynamic Consumption plan
-    -OSType Linux `
-    -EnableSystemAssignedIdentity $true ` # Good for Azure Key Vault integration & other Azure resource auth
-    -AppSettings $appSettings `
-    -InstrumentationKey $AppInsightsInstrumentationKey ` # Direct linking for some portal views/older compatibility
-    -ErrorAction Stop | Out-Null
+az functionapp create --name $FunctionAppName --resource-group $ResourceGroupName --storage-account $StorageAccountName --consumption-plan-location $Location --os-type "Linux" --runtime "python" --runtime-version "3.11" --functions-version "4" --assign-identity "[system]" --app-insights $AppInsightsName --output none
+if ($LASTEXITCODE -ne 0) { Write-Error "Failed to create Function App. Script aborted."; exit 1 }
+Write-Host "Function App '$FunctionAppName' created successfully."
+Write-Host ""
+
+# --- Configure Application Settings for the Function App ---
+Write-Host "Configuring Application Settings for $FunctionAppName..."
+$appSettings = @(
+    "FUNCTIONS_WORKER_RUNTIME=python",
+    "FUNCTIONS_EXTENSION_VERSION=~4",
+    "WEBSITE_RUN_FROM_PACKAGE=1",
+    "SHIFTBASE_API_URL=$($ShiftbaseURL)",
+    "SHIFTBASE_API_KEY=$($ShiftbaseAPIKey)",
+    "DB_CONNECTION_STRING=$($DBConnectionString)",
+    "DB_TARGET_TABLE=$($DBTargetTable)"
+)
+
+if ($AppInsightsInstrumentationKey) {
+    $appSettings += "APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=$($AppInsightsInstrumentationKey)"
+}
+
+az functionapp config appsettings set --name $FunctionAppName --resource-group $ResourceGroupName --settings $appSettings --output none
+if ($LASTEXITCODE -ne 0) { Write-Warning "Failed to set some application settings. Please verify in Azure Portal." }
+else { Write-Host "Application settings configured for $FunctionAppName."}
+Write-Host ""
 
 Write-Host "--------------------------------------------------------------------"
 Write-Host "Script completed at $(Get-Date)."
@@ -87,20 +113,23 @@ Write-Host "Resource Group:         $ResourceGroupName"
 Write-Host "Storage Account:        $StorageAccountName"
 Write-Host "Application Insights:   $AppInsightsName"
 Write-Host "Function App Name:      $FunctionAppName"
-Write-Host "Function App Plan Name: $PlanName (Consumption Plan)"
 Write-Host "Function App Location:  $Location"
-Write-Host "Function App Runtime:   Python 3.11 (Linux)" # Verify this matches your needs
+Write-Host "Function App Runtime:   Python 3.11 (Linux, Consumption Plan)"
 Write-Host ""
-Write-Host "The following Application Settings have been configured for '$FunctionAppName':"
-$appSettings.GetEnumerator() | ForEach-Object { 
-    If ($_.Name -in @("SHIFTBASE_API_KEY", "DB_CONNECTION_STRING")) {
-        Write-Host "  $($_.Name) = [Value Set - Hidden for Security]" 
-    } Else {
-        Write-Host "  $($_.Name) = $($_.Value)" 
-    }
+Write-Host "The following Application Settings have been configured (values for secrets are not displayed here for security):"
+Write-Host "  FUNCTIONS_WORKER_RUNTIME=python"
+Write-Host "  FUNCTIONS_EXTENSION_VERSION=~4"
+Write-Host "  WEBSITE_RUN_FROM_PACKAGE=1"
+if ($AppInsightsInstrumentationKey) {
+    Write-Host "  APPLICATIONINSIGHTS_CONNECTION_STRING=InstrumentationKey=**********"
+} else {
+    Write-Host "  APPLICATIONINSIGHTS_CONNECTION_STRING was not explicitly set by this script (key not found or relying on auto-config by --app-insights flag)."
 }
+Write-Host "  SHIFTBASE_API_URL=$($ShiftbaseURL)"
+Write-Host "  SHIFTBASE_API_KEY=**********" 
+Write-Host "  DB_CONNECTION_STRING=**********"
+Write-Host "  DB_TARGET_TABLE=$($DBTargetTable)"
 Write-Host ""
-Write-Host "Access your Function App in the Azure portal or at: https://$FunctionAppName.azurewebsites.net"
-Write-Host "IMPORTANT: If you used placeholder values for SHIFTBASE_API_KEY or DB_CONNECTION_STRING,"
-Write-Host "           you MUST update them in the Azure portal (Function App -> Configuration) for the function to work correctly."
+Write-Host "Access your Function App in the Azure portal or at: https://$($FunctionAppName).azurewebsites.net"
+Write-Host "IMPORTANT: Ensure you have replaced placeholder values for SHIFTBASE_API_KEY and DB_CONNECTION_STRING in the script."
 Write-Host "--------------------------------------------------------------------"
